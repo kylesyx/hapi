@@ -21,6 +21,7 @@ import { applySuggestion } from '@/utils/applySuggestion'
 import { usePlatform } from '@/hooks/usePlatform'
 import { usePWAInstall } from '@/hooks/usePWAInstall'
 import { isClaudeFlavor } from '@/lib/agentFlavorUtils'
+import { clearDraft, getDraft, saveDraft } from '@/lib/composer-drafts'
 import { markSkillUsed } from '@/lib/recent-skills'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
@@ -37,6 +38,7 @@ export interface TextInputState {
 const defaultSuggestionHandler = async (): Promise<Suggestion[]> => []
 
 export function HappyComposer(props: {
+    sessionId?: string
     disabled?: boolean
     permissionMode?: PermissionMode
     modelMode?: ModelMode
@@ -61,6 +63,7 @@ export function HappyComposer(props: {
 }) {
     const { t } = useTranslation()
     const {
+        sessionId,
         disabled = false,
         permissionMode: rawPermissionMode,
         modelMode: rawModelMode,
@@ -119,6 +122,8 @@ export function HappyComposer(props: {
     const [showContinueHint, setShowContinueHint] = useState(false)
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
+    const prevDraftSessionIdRef = useRef<string | null>(null)
+    const restoreDraftFrameRef = useRef<number | null>(null)
     const prevControlledByUser = useRef(controlledByUser)
 
     useEffect(() => {
@@ -130,6 +135,43 @@ export function HappyComposer(props: {
             return { text: composerText, selection: { start: newPos, end: newPos } }
         })
     }, [composerText])
+
+    useEffect(() => {
+        return () => {
+            if (restoreDraftFrameRef.current === null) return
+            cancelAnimationFrame(restoreDraftFrameRef.current)
+        }
+    }, [])
+
+    useEffect(() => {
+        if (prevDraftSessionIdRef.current === sessionId) return
+
+        if (restoreDraftFrameRef.current !== null) {
+            cancelAnimationFrame(restoreDraftFrameRef.current)
+            restoreDraftFrameRef.current = null
+        }
+
+        prevDraftSessionIdRef.current = sessionId ?? null
+        if (!sessionId) {
+            api.composer().setText('')
+            return
+        }
+
+        const draft = getDraft(sessionId)
+        const restoreSessionId = sessionId
+        // Restore after runtime switch settles; ignore stale frame on rapid navigation.
+        restoreDraftFrameRef.current = requestAnimationFrame(() => {
+            restoreDraftFrameRef.current = null
+            if (prevDraftSessionIdRef.current !== restoreSessionId) return
+            api.composer().setText(draft)
+        })
+    }, [sessionId, api])
+
+    useEffect(() => {
+        if (!sessionId) return
+        if (prevDraftSessionIdRef.current !== sessionId) return
+        saveDraft(sessionId, composerText)
+    }, [sessionId, composerText])
 
     // Track one-time "continue" hint after switching from local to remote.
     useEffect(() => {
@@ -241,6 +283,17 @@ export function HappyComposer(props: {
         }
     }, [switchDisabled, onSwitchToRemote, haptic])
 
+    const clearCurrentDraft = useCallback(() => {
+        if (!sessionId) return
+        clearDraft(sessionId)
+    }, [sessionId])
+
+    const sendComposer = useCallback(() => {
+        clearCurrentDraft()
+        api.composer().send()
+        setShowContinueHint(false)
+    }, [clearCurrentDraft, api])
+
     const permissionModeOptions = useMemo(
         () => getPermissionModeOptionsForFlavor(agentFlavor),
         [agentFlavor]
@@ -262,8 +315,7 @@ export function HappyComposer(props: {
         if (key === 'Enter' && e.shiftKey) {
             e.preventDefault()
             if (!canSend) return
-            api.composer().send()
-            setShowContinueHint(false)
+            sendComposer()
             return
         }
 
@@ -318,7 +370,7 @@ export function HappyComposer(props: {
         permissionMode,
         permissionModes,
         canSend,
-        api,
+        sendComposer,
         haptic
     ])
 
@@ -380,8 +432,9 @@ export function HappyComposer(props: {
             event.preventDefault()
             return
         }
+        clearCurrentDraft()
         setShowContinueHint(false)
-    }, [attachmentsReady])
+    }, [attachmentsReady, clearCurrentDraft])
 
     const handlePermissionChange = useCallback((mode: PermissionMode) => {
         if (!onPermissionModeChange || controlsDisabled) return
@@ -404,8 +457,8 @@ export function HappyComposer(props: {
     const voiceEnabled = Boolean(onVoiceToggle)
 
     const handleSend = useCallback(() => {
-        api.composer().send()
-    }, [api])
+        sendComposer()
+    }, [sendComposer])
 
     const overlays = useMemo(() => {
         if (showSettings && (showPermissionSettings || showModelSettings)) {
