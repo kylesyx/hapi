@@ -158,6 +158,20 @@ function resolveOutdir(projectRoot: string, outdir: string): string {
     return join(projectRoot, outdir);
 }
 
+async function signDarwinExecutable(outfile: string): Promise<void> {
+    const proc = Bun.spawn({
+        cmd: ['codesign', '--force', '--sign', '-', outfile],
+        env: process.env,
+        stdout: 'inherit',
+        stderr: 'inherit'
+    });
+
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
+        throw new Error(`codesign failed for ${outfile} (exit ${exitCode})`);
+    }
+}
+
 function writeStubEmbeddedAssets(workspaceRoot: string): void {
     const outputPath = join(workspaceRoot, 'hub', 'src', 'web', 'embeddedAssets.generated.ts');
     const contents = [
@@ -236,6 +250,13 @@ async function buildTarget(projectRoot: string, target: string, outdir: string, 
     const exitCode = await proc.exited;
     if (exitCode !== 0) {
         throw new Error(`Build failed for target ${target} (exit ${exitCode})`);
+    }
+
+    // macOS 26 rejects the raw Bun-produced Mach-O with SIGKILL (Code Signature Invalid).
+    // Re-sign the executable after compilation so packaged binaries launch reliably.
+    if (platform === 'darwin' && resolveHostPlatform() === 'darwin') {
+        console.log(`[build:exe] codesign ${outfile}`);
+        await signDarwinExecutable(outfile);
     }
 }
 
