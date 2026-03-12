@@ -27,11 +27,16 @@ type ApiClientOptions = {
     baseUrl?: string
     getToken?: () => string | null
     onUnauthorized?: () => Promise<string | null>
+    onAccessSessionExpired?: () => void
 }
 
 type ErrorPayload = {
     error?: unknown
 }
+
+const JSON_CONTENT_TYPE = 'application/json'
+const XML_HTTP_REQUEST_HEADER = 'X-Requested-With'
+const XML_HTTP_REQUEST_VALUE = 'XMLHttpRequest'
 
 function parseErrorCode(bodyText: string): string | undefined {
     try {
@@ -61,12 +66,14 @@ export class ApiClient {
     private readonly baseUrl: string | null
     private readonly getToken: (() => string | null) | null
     private readonly onUnauthorized: (() => Promise<string | null>) | null
+    private readonly onAccessSessionExpired: (() => void) | null
 
     constructor(token: string, options?: ApiClientOptions) {
         this.token = token
         this.baseUrl = options?.baseUrl ?? null
         this.getToken = options?.getToken ?? null
         this.onUnauthorized = options?.onUnauthorized ?? null
+        this.onAccessSessionExpired = options?.onAccessSessionExpired ?? null
     }
 
     private buildUrl(path: string): string {
@@ -80,28 +87,73 @@ export class ApiClient {
         }
     }
 
+    private isSameOrigin(url: string): boolean {
+        if (typeof window === 'undefined') {
+            return false
+        }
+        try {
+            return new URL(url, window.location.href).origin === window.location.origin
+        } catch {
+            return false
+        }
+    }
+
+    private createHeaders(url: string, init?: RequestInit, authToken?: string | null): Headers {
+        const headers = new Headers(init?.headers)
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+        if (init?.body !== undefined && !headers.has('content-type')) {
+            headers.set('content-type', JSON_CONTENT_TYPE)
+        }
+        if (this.isSameOrigin(url) && !headers.has(XML_HTTP_REQUEST_HEADER)) {
+            // Ask Cloudflare Access to return 401 for AJAX instead of redirecting fetch to the login domain.
+            headers.set(XML_HTTP_REQUEST_HEADER, XML_HTTP_REQUEST_VALUE)
+        }
+        return headers
+    }
+
+    private isLikelyAccessReauthResponse(url: string, response: Response): boolean {
+        if (!this.isSameOrigin(url)) {
+            return false
+        }
+        if (response.status !== 401 && response.status !== 403) {
+            return false
+        }
+        const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+        return !contentType.includes(JSON_CONTENT_TYPE)
+    }
+
+    private handleAccessSessionExpired(): never {
+        if (this.onAccessSessionExpired) {
+            this.onAccessSessionExpired()
+        } else if (typeof window !== 'undefined') {
+            window.location.assign(window.location.href)
+        }
+        throw new Error('Cloudflare Access session expired. Redirecting to sign in again.')
+    }
+
     private async request<T>(
         path: string,
         init?: RequestInit,
         attempt: number = 0,
         overrideToken?: string | null
     ): Promise<T> {
-        const headers = new Headers(init?.headers)
+        const url = this.buildUrl(path)
         const liveToken = this.getToken ? this.getToken() : null
         const authToken = overrideToken !== undefined
             ? (overrideToken ?? (liveToken ?? this.token))
             : (liveToken ?? this.token)
-        if (authToken) {
-            headers.set('authorization', `Bearer ${authToken}`)
-        }
-        if (init?.body !== undefined && !headers.has('content-type')) {
-            headers.set('content-type', 'application/json')
-        }
+        const headers = this.createHeaders(url, init, authToken)
 
-        const res = await fetch(this.buildUrl(path), {
+        const res = await fetch(url, {
             ...init,
             headers
         })
+
+        if (this.isLikelyAccessReauthResponse(url, res)) {
+            this.handleAccessSessionExpired()
+        }
 
         if (res.status === 401) {
             if (attempt === 0 && this.onUnauthorized) {
@@ -123,11 +175,16 @@ export class ApiClient {
     }
 
     async authenticate(auth: { initData: string } | { accessToken: string }): Promise<AuthResponse> {
-        const res = await fetch(this.buildUrl('/api/auth'), {
+        const url = this.buildUrl('/api/auth')
+        const res = await fetch(url, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: this.createHeaders(url, { body: JSON.stringify(auth) }),
             body: JSON.stringify(auth)
         })
+
+        if (this.isLikelyAccessReauthResponse(url, res)) {
+            this.handleAccessSessionExpired()
+        }
 
         if (!res.ok) {
             const body = await res.text().catch(() => '')
@@ -140,11 +197,16 @@ export class ApiClient {
     }
 
     async bind(auth: { initData: string; accessToken: string }): Promise<AuthResponse> {
-        const res = await fetch(this.buildUrl('/api/bind'), {
+        const url = this.buildUrl('/api/bind')
+        const res = await fetch(url, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: this.createHeaders(url, { body: JSON.stringify(auth) }),
             body: JSON.stringify(auth)
         })
+
+        if (this.isLikelyAccessReauthResponse(url, res)) {
+            this.handleAccessSessionExpired()
+        }
 
         if (!res.ok) {
             const body = await res.text().catch(() => '')
